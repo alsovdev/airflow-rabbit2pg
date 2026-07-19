@@ -102,6 +102,11 @@ services:
     command: webserver
     ports:
       - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
     depends_on:
       <<: *airflow-common-depends-on
 
@@ -117,6 +122,36 @@ services:
     depends_on:
       <<: *airflow-common-depends-on
 
+  rabbitmq-consumer:
+    build:
+      context: ./consumer
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: airflow
+      RABBITMQ_PASS: airflow
+      AIRFLOW_API_URL: "http://airflow-webserver:8080/api/v1"
+      AIRFLOW_USER: admin
+      AIRFLOW_PASS: admin
+      # Static queue->DAG mapping. Demo uses 3 queues; see queue_dag_map.json for the 100-queue template.
+      QUEUE_DAG_MAP: '{"orders": "demo_orders", "signals": "demo_signals", "alerts": "demo_alerts"}'
+      PG_HOST: postgres-data
+      PG_PORT: "5432"
+      PG_USER: datauser
+      PG_PASS: datapass
+      PG_DB: datadb
+      HEARTBEAT_TABLE: consumer_heartbeat
+      HEARTBEAT_INTERVAL: "15"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      airflow-webserver:
+        condition: service_healthy
+      postgres-data:
+        condition: service_healthy
+
   producer:
     build:
       context: ./producer
@@ -126,7 +161,7 @@ services:
       RABBITMQ_PORT: "5672"
       RABBITMQ_USER: airflow
       RABBITMQ_PASS: airflow
-      RABBITMQ_QUEUE: messages
+      RABBITMQ_QUEUE: orders
     depends_on:
       rabbitmq:
         condition: service_healthy

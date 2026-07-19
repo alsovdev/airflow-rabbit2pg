@@ -1,49 +1,56 @@
-# Apache Airflow + RabbitMQ + PostgreSQL Demo
+# Apache Airflow + RabbitMQ + PostgreSQL — Event-Driven Demo
 
-Пайплайн, в котором Apache Airflow запускает постоянный long-running consumer
-на базе AMQP (`pika.basic_consume`): процесс непрерывно слушает очередь RabbitMQ
-и в реальном времени сохраняет каждое сообщение в таблицу PostgreSQL. Отдельный
-producer отправляет тестовые данные в RabbitMQ. Шедулер НЕ опрашивает очередь —
-consumer живёт как долгоживущая задача и реагирует на сообщения сразу.
+RabbitMQ используется как шина событий. **Отдельный сервис `rabbitmq-consumer`**
+(вне Airflow) слушает очереди и по статичному маппингу `queue -> DAG` вызывает
+Airflow REST API, запуская нужный DAG и передавая ему тело сообщения как `conf`.
+DAG затем вызывает внешний REST-сервис (с его собственной авторизацией). Airflow
+НЕ держит долгоживущих коннектов к RabbitMQ и не блокирует слоты воркеров.
+
+## Поток данных
+
+```
+RabbitMQ (100 очередей)
+   │  basic_consume (push), отдельный сервис
+   ▼
+rabbitmq-consumer  ── POST /api/v1/dags/{dag_id}/dagRuns (conf=payload) ──▶ Airflow
+   │  restart: unless-stopped (self-healing вне Airflow)                         │
+   │                                                                             ▼
+   │                                                         DAG: PythonOperator
+   │                                                           requests.post(внешний API)
+   ▼                                                                             │
+heartbeat в PostgreSQL (для watchdog-алертов)                            внешний REST-сервис
+```
 
 ## Сервисы (docker-compose.yml)
 
-| Сервис             | Назначение                                              | Порты        |
-|--------------------|---------------------------------------------------------|--------------|
-| `postgres-airflow` | Метаданные Airflow (бэкенд БД + Celery result backend)  | 5432 (внутр) |
-| `postgres-data`    | Хранилище сообщений (`datadb`, таблица `messages`)      | 5432 (внутр) |
-| `rabbitmq`         | Брокер сообщений (очередь `messages`) + management UI   | 5672, 15672  |
-| `redis`            | Брокер Celery для Airflow executor                      | 6379 (внутр) |
-| `airflow-webserver`| Веб-интерфейс Airflow                                   | 8080         |
-| `airflow-scheduler`| Планировщик DAG                                         | —            |
-| `airflow-worker`   | Celery-воркер, исполняющий таски                         | —            |
-| `airflow-init`     | Миграция БД и создание пользователя admin               | —            |
-| `producer`         | Пример-приложение, отправляющее сообщения в RabbitMQ    | —            |
+| Сервис              | Назначение                                                       | Порты        |
+|---------------------|------------------------------------------------------------------|--------------|
+| `postgres-airflow`  | Метаданные Airflow                                               | 5432 (внутр) |
+| `postgres-data`     | Хранилище heartbeat (`consumer_heartbeat`)                      | 5432 (внутр) |
+| `rabbitmq`          | Брокер (очереди) + management UI                                | 5672, 15672  |
+| `redis`             | Celery broker для Airflow                                        | 6379 (внутр) |
+| `airflow-webserver` | Веб-UI + REST API (`/api/v1`)                                    | 8080         |
+| `airflow-scheduler` | Планировщик DAG                                                  | —            |
+| `airflow-worker`    | Celery-воркер, исполняет DAG-задачи                             | —            |
+| `rabbitmq-consumer` | **Отдельный** сервис: слушает очереди, триггерит DAG через API  | —            |
+| `producer`          | Пример-приложение, отправляющее сообщения в очередь             | —            |
 
 ## Структура
 
 ```
 docker-compose.yml
-dags/rabbitmq_consumer.py         # standalone AMQP consumer (pika.basic_consume -> Postgres)
-dags/rabbitmq_consumer_daemon.py  # DEPRECATED: DAG-обёртка, запускает consumer как long-running задачу
-dags/rabbitmq_watchdog.py         # Watchdog DAG: проверяет heartbeat и авто-перезапускает consumer
-producer/producer.py              # Пример producer-а
-producer/Dockerfile
-airflow/Dockerfile                # Кастомный образ Airflow
-init-db/01_init.sql               # Создание таблицы messages
-init-db/02_heartbeat.sql          # Создание таблицы consumer_heartbeat
-```
-
-## Поток данных
-
-```
-producer.py ──publish──> RabbitMQ (queue: messages)
-                               │
-            Airflow DAG run (long-running task, basic_consume)
-            процесс слушает очередь постоянно и пишет каждое сообщение сразу
-                               │
-                               ▼
-                  PostgreSQL datadb.messages (body TEXT)
+consumer/
+  Dockerfile              # лёгкий образ (python:3.11-slim + pika/requests/psycopg2)
+  consumer_service.py     # router: RabbitMQ -> Airflow REST API (вне Airflow)
+  queue_dag_map.json      # шаблон маппинга на 100 очередей (с комментариями)
+dags/
+  rabbitmq_external_api_dags.py  # шаблон DAG (заглушка POST к внешнему API) + генерация 100
+  rabbitmq_watchdog.py           # монитор живости сервиса (alert only)
+producer/
+  Dockerfile
+  producer.py             # отправляет тестовое сообщение в очередь (env RABBITMQ_QUEUE)
+airflow/Dockerfile        # кастомный образ Airflow
+init-db/02_heartbeat.sql  # таблица consumer_heartbeat
 ```
 
 ## Запуск
@@ -51,79 +58,61 @@ producer.py ──publish──> RabbitMQ (queue: messages)
 ```bash
 docker compose build
 docker compose up -d
-# consumer запускается как долгоживущая задача (schedule=None):
-docker compose exec airflow-scheduler airflow dags unpause rabbitmq_consumer_daemon
-docker compose exec airflow-scheduler airflow dags trigger rabbitmq_consumer_daemon
-# в отдельном терминале отправляем сообщения — они попадут в БД мгновенно:
-docker compose run --rm producer
+# unpause демо-DAG-ов (созданы файлом dags/rabbitmq_external_api_dags.py):
+docker compose exec airflow-scheduler airflow dags unpause demo_orders
+docker compose exec airflow-scheduler airflow dags unpause demo_signals
+docker compose exec airflow-scheduler airflow dags unpause demo_alerts
+# отправить тестовое сообщение в очередь (orders|signals|alerts):
+docker compose run --rm -e RABBITMQ_QUEUE=orders producer
 ```
 
-DAG `rabbitmq_consumer_daemon` имеет `schedule=None` и `max_active_runs=1`:
-он не планируется шедулером, а запускается вручную и работает постоянно, пока
-жив процесс (consumer НЕ завершается при простое). Graceful shutdown по SIGTERM
-(кнопка Clear / завершение run). Если consumer остановлен, перезапустите run
-вручную — накопленные в очереди сообщения будут обработаны.
+Сообщение из `orders` вызовет `POST .../dags/demo_orders/dagRuns` с `conf`,
+DAG `demo_orders` запустится и выполнит заглушку внешнего вызова.
 
-> **DEPRECATED**: long-running consumer внутри Airflow-воркера — антипаттерн
-> (блокирует слот воркера, падает при рестарте воркера). Оставлено для демо;
-> в проде consumer выносится в отдельный сервис вне Airflow.
+## Проверка
 
-## Watchdog (наблюдение и авто-перезапуск)
-
-DAG `rabbitmq_watchdog` (`schedule="*/5 * * * *"`) раз в 5 минут проверяет
-«живость» consumer-а по таблице `consumer_heartbeat`:
-
-- Consumer пишет туда запись `last_seen` каждые `HEARTBEAT_INTERVAL` сек (15).
-- Watchdog берёт `MAX(last_seen)`; если `NOW() - last_seen > WATCHDOG_THRESHOLD_SECONDS`
-  (60), считает consumer мёртвым и **автоматически перезапускает** legacy-DAG
-  `rabbitmq_consumer_daemon` через `airflow dags trigger`. Иначе — success.
-- При неудаче trigger-а таск падает с `AirflowException` (видно в UI/алертах).
-
+Очередь пуста после обработки:
 ```bash
-docker compose exec airflow-scheduler airflow dags unpause rabbitmq_watchdog
-docker compose exec airflow-scheduler airflow dags trigger rabbitmq_watchdog   # ручная проверка
+docker compose exec rabbitmq rabbitmqctl list_queues name messages_ready
 ```
-
-Смотреть heartbeat:
-
+Conf у последнего run DAG-а (подтверждает доставку payload из очереди):
+```bash
+docker compose exec rabbitmq-consumer python -c "
+import requests; s=requests.Session(); s.auth=('admin','admin')
+print(s.get('http://airflow-webserver:8080/api/v1/dags/demo_orders/dagRuns/<run_id>').json()['conf'])
+"
+```
+Heartbeat сервиса (для watchdog):
 ```bash
 docker compose exec postgres-data psql -U datauser -d datadb -c "SELECT MAX(last_seen) FROM consumer_heartbeat;"
 ```
 
-## Проверка
+## Масштабирование на ~100 очередей
 
-Очередь в RabbitMQ:
-
-```bash
-docker compose exec rabbitmq rabbitmqctl list_queues name messages_ready
-```
-
-Таблица в PostgreSQL:
-
-```bash
-docker compose exec postgres-data psql -U datauser -d datadb -c "SELECT id, body, received_at FROM messages ORDER BY id;"
-```
+- `consumer/queue_dag_map.json` — статичный маппинг `queue -> dag_id` (шаблон на 100).
+  Смонтируйте его в сервис и задайте `QUEUE_DAG_MAP=/app/queue_dag_map.json`.
+- DAG-и генерируются той же фабрикой `make_dag()` (см. `dags/rabbitmq_external_api_dags.py`),
+  читая тот же маппинг — одна очередь → один DAG.
+- Один `rabbitmq-consumer` процесс держит 100 `basic_consume`. Для распределения
+  нагрузки поднимите N реплик сервиса и разделите маппинг между ними
+  (каждая реплика получает подмножество очередей).
+- В k8s вместо `restart: unless-stopped` используйте ReplicaSet/Deployment —
+  он даёт настоящий self-healing и горизонтальное масштабирование.
 
 ## Доступы
 
-- Airflow UI: http://localhost:8080 — `admin` / `admin`
+- Airflow UI / API: http://localhost:8080 — `admin` / `admin`
+  (consumer использует эти же учётные данные для Basic Auth к REST API)
 - RabbitMQ UI: http://localhost:15672 — `airflow` / `airflow`
 
-## Подключения (хосты внутри сети docker-compose)
+## Заметки по архитектуре
 
-- RabbitMQ: `rabbitmq:5672`, user `airflow` / pass `airflow`, queue `messages`
-- PostgreSQL data: `postgres-data:5432`, db `datadb`, user `datauser` / `datapass`
-
-## Заметки
-
-- Consumer — это standalone-скрипт `dags/rabbitmq_consumer.py` (чистые `pika`
-  + `psycopg2`), запускаемый DAG-обёрткой через `BashOperator`. Он использует
-  `basic_consume` (push-модель), а не `basic_get` по расписанию.
-- Доп. зависимости ставятся через `_PIP_ADDITIONAL_REQUIREMENTS` (pika, psycopg2-binary).
-- Таблица `messages` создаётся автоматически init-скриптом `init-db/01_init.sql`
-  при первом старте `postgres-data`.
-- Consumer переподключается при потере AMQP-соединения и делает `basic_ack` только
-  после успешной записи в БД (at-least-once доставка).
-- Таблица `consumer_heartbeat` (init-db/02_heartbeat.sql) используется watchdog-ом
-  для определения живости consumer-а вне Airflow API. Пороги настраиваются через
-  env: `HEARTBEAT_INTERVAL`, `WATCHDOG_THRESHOLD_SECONDS`.
+- **Consumer вне Airflow.** Long-running процесс больше НЕ внутри воркера
+  (это был антипаттерн: блокировал слот, умирал при рестарте воркера). Теперь
+  это отдельный сервис с `restart: unless-stopped` (или ReplicaSet в k8s).
+- **At-least-once.** При сбое вызова Airflow API сообщение возвращается в очередь
+  (`basic_nack(requeue=True)`), событие не теряется.
+- **Watchdog** только алертит при простое heartbeat (>60с); сам сервис
+  перезапускается политикой restart, watchdog не триггерит его (он вне Airflow).
+- **DAG — заглушка.** В `call_external_api` закомментирован реальный `requests.post`;
+  авторизация внешнего сервиса выносится в Airflow Connection/Variable.

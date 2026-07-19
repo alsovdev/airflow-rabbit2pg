@@ -1,5 +1,0 @@
-CREATE TABLE IF NOT EXISTS messages (
-    id SERIAL PRIMARY KEY,
-    body TEXT NOT NULL,
-    received_at TIMESTAMP NOT NULL DEFAULT NOW()
-);
