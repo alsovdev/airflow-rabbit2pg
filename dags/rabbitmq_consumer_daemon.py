@@ -1,3 +1,5 @@
+# DEPRECATED: long-running anti-pattern (Airflow worker slot blocked indefinitely).
+# Consumer liveness is now monitored and auto-restarted by the rabbitmq_watchdog DAG.
 from datetime import datetime, timedelta
 
 from airflow import DAG
@@ -11,7 +13,7 @@ default_args = {
 with DAG(
     dag_id="rabbitmq_consumer_daemon",
     default_args=default_args,
-    description="Long-running RabbitMQ consumer that stores messages into PostgreSQL",
+    description="DEPRECATED long-running RabbitMQ consumer (legacy, auto-restarted by rabbitmq_watchdog)",
     schedule=None,
     start_date=datetime(2024, 1, 1),
     catchup=False,

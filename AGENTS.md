@@ -40,12 +40,23 @@ docker compose exec rabbitmq rabbitmqctl list_queues name messages_ready
   via `BashOperator`. It uses `basic_consume` (push), not scheduled `basic_get`.
 - DAG `rabbitmq_consumer_daemon` has `schedule=None` and `max_active_runs=1`: it
   must be triggered manually and runs as a long-lived task until the process ends.
-  It auto-exits after `MAX_IDLE_SECONDS` (300) of no messages for a clean restart.
 - After editing a DAG file, the scheduler may not register it immediately. If
   `airflow dags trigger <id>` fails with `DagNotFound`, run
   `docker compose exec airflow-scheduler airflow dags reserialize` to sync.
 - The old scheduled DAG (`rabbitmq_to_postgres.py`, `basic_get` every minute) was
   removed in favor of the persistent consumer. Do not reintroduce it.
+- `rabbitmq_consumer_daemon` is DEPRECATED (long-running anti-pattern: blocks a
+  worker slot, dies on worker restart). Kept for demo only.
+
+## Watchdog (liveness + auto-heal)
+
+- `rabbitmq_watchdog` DAG (`schedule="*/5 * * * *"`) checks consumer liveness via
+  the `consumer_heartbeat` table and **auto-restarts** `rabbitmq_consumer_daemon`
+  (via `airflow dags trigger`) when heartbeat is older than `WATCHDOG_THRESHOLD_SECONDS` (60).
+- Consumer writes `last_seen` to `consumer_heartbeat` every `HEARTBEAT_INTERVAL` (15s).
+- `PythonOperator` does NOT accept `env` (that's BashOperator-only) — watchdog reads
+  connection settings from code defaults (postgres-data/datauser/datapass/datadb).
+- Manual check: `docker compose exec airflow-scheduler airflow dags trigger rabbitmq_watchdog`
 
 ## Env / connections (docker-compose service hostnames)
 

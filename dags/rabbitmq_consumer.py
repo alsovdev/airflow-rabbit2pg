@@ -20,6 +20,9 @@ PG_PASS = os.getenv("PG_PASS", "datapass")
 PG_DB = os.getenv("PG_DB", "datadb")
 PG_TABLE = os.getenv("PG_TABLE", "messages")
 
+HEARTBEAT_TABLE = os.getenv("HEARTBEAT_TABLE", "consumer_heartbeat")
+HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "15"))
+
 
 class Consumer:
     def __init__(self):
@@ -28,6 +31,9 @@ class Consumer:
         )
         self.pg_conn.autocommit = True
         self.pg_cursor = self.pg_conn.cursor()
+        self.hb_cursor = self.pg_conn.cursor()
+        self._last_heartbeat_ts = 0.0
+        self._write_heartbeat()
 
         credentials = pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASS)
         self.connection = pika.BlockingConnection(
@@ -49,6 +55,16 @@ class Consumer:
     def _handle_signal(self, signum, frame):
         print(f"Received signal {signum}, shutting down gracefully...")
         self._stop = True
+
+    def _write_heartbeat(self):
+        self.hb_cursor.execute(
+            f"INSERT INTO {HEARTBEAT_TABLE} (last_seen) VALUES (NOW())"
+        )
+        self._last_heartbeat_ts = time.time()
+
+    def _maybe_heartbeat(self):
+        if time.time() - self._last_heartbeat_ts >= HEARTBEAT_INTERVAL:
+            self._write_heartbeat()
 
     def _store(self, body: bytes):
         self.pg_cursor.execute(
@@ -76,6 +92,8 @@ class Consumer:
                 print("[!] Connection lost, reconnecting...")
                 self._reconnect()
                 continue
+
+            self._maybe_heartbeat()
 
         self.close()
 
@@ -111,6 +129,7 @@ class Consumer:
             pass
         try:
             self.pg_cursor.close()
+            self.hb_cursor.close()
             self.pg_conn.close()
         except Exception:
             pass
