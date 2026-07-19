@@ -1,4 +1,0 @@
-CREATE TABLE IF NOT EXISTS consumer_heartbeat (
-    id SERIAL PRIMARY KEY,
-    last_seen TIMESTAMP NOT NULL DEFAULT NOW()
-);

@@ -17,10 +17,10 @@ connections and does NOT block worker slots.
   `dags/rabbitmq_external_api_dags.py` (3 demo DAGs + generated from the same map).
   `schedule=None` — only triggered via API.
 - `dags/rabbitmq_watchdog.py` (`*/5 * * * *`) only ALERTS if the consumer service
-  heartbeat is stale (>60s). It does NOT restart the service (service self-heals via
-  restart policy; it lives outside Airflow).
-- `consumer_heartbeat` table (init-db/02_heartbeat.sql) is written by the consumer
-  service every `HEARTBEAT_INTERVAL` (15s) for the watchdog to read.
+  `/healthz` endpoint is down or stale (>60s). It does NOT restart the service
+  (service self-heals via restart policy; it lives outside Airflow).
+- Consumer liveness is exposed via HTTP `GET /healthz` (port 8081) returning
+  `{"status": "ok"|"dead", "age": <sec>}`. No database is involved.
 
 ## Commands
 
@@ -56,20 +56,23 @@ docker compose exec rabbitmq rabbitmqctl list_queues name messages_ready
 ## Env / connections (docker-compose service hostnames)
 
 - RabbitMQ: `rabbitmq:5672`, user `airflow` / pass `airflow`
-- PostgreSQL data: `postgres-data:5432`, db `datadb`, user `datauser` / `datapass`
 - Airflow API: `http://airflow-webserver:8080/api/v1`, auth `admin` / `admin`
   (consumer uses these for Basic Auth; set via AIRFLOW_USER/AIRFLOW_PASS)
+- Consumer health: `http://rabbitmq-consumer:8081/healthz` (no DB involved)
 - Airflow UI: http://localhost:8080 (admin/admin); RabbitMQ UI: http://localhost:15672
 
 ## Gotchas
 
 - `_PIP_ADDITIONAL_REQUIREMENTS` on the Airflow image installs `pika psycopg2-binary`.
-  The consumer service has its own image (python:3.11-slim + pika/requests/psycopg2).
+  The consumer service has its own image (python:3.11-slim + pika/requests, NO psycopg2).
 - Do NOT reintroduce a long-running DAG inside Airflow (old `rabbitmq_consumer_daemon.py`
   / `rabbitmq_consumer.py` were removed). Consumer logic belongs in `consumer/`.
+- The consumer holds NO DB connection; there is no `postgres-data` service anymore.
+  Liveness = `/healthz` (updated every loop tick, independent of message traffic).
 - `airflow-webserver` has a curl-based `/health` healthcheck so `rabbitmq-consumer`
   can wait on it (`depends_on: condition: service_healthy`).
 - On message API-trigger failure the consumer does `basic_nack(requeue=True)` so no
   event is lost (at-least-once).
-- `data-db-data` volume recreate drops the `consumer_heartbeat` table (recreated by
-  init-db/02_heartbeat.sql on first start).
+- After editing a DAG file, if a triggered run stays `queued`, the DAG is likely
+  still paused — run `airflow dags unpause <dag_id>` (recreate via `dags delete`
+  resets it to paused).

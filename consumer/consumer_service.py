@@ -10,6 +10,11 @@ Why outside Airflow:
   dies on worker restart). This service is managed by docker-compose
   (restart: unless-stopped) / k8s ReplicaSet, so it self-heals independently.
 
+Liveness:
+  The service exposes GET /healthz returning the age of the last processed event.
+  The rabbitmq_watchdog DAG polls this endpoint instead of a database heartbeat,
+  so the consumer holds NO connection to PostgreSQL at all.
+
 Static queue->DAG mapping is provided via QUEUE_DAG_MAP (JSON string or file path).
 """
 import os
@@ -17,11 +22,12 @@ import sys
 import time
 import json
 import signal
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pika
 import requests
-import psycopg2
 
 RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "rabbitmq")
 RABBITMQ_PORT = int(os.getenv("RABBITMQ_PORT", "5672"))
@@ -39,14 +45,9 @@ QUEUE_DAG_MAP_RAW = os.getenv(
     '{"orders": "demo_orders", "signals": "demo_signals", "alerts": "demo_alerts"}',
 )
 
-HEARTBEAT_TABLE = os.getenv("HEARTBEAT_TABLE", "consumer_heartbeat")
-HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "15"))
-
-PG_HOST = os.getenv("PG_HOST", "postgres-data")
-PG_PORT = int(os.getenv("PG_PORT", "5432"))
-PG_USER = os.getenv("PG_USER", "datauser")
-PG_PASS = os.getenv("PG_PASS", "datapass")
-PG_DB = os.getenv("PG_DB", "datadb")
+HEALTH_PORT = int(os.getenv("HEALTH_PORT", "8081"))
+# If no event processed for this many seconds, report unhealthy.
+HEALTH_THRESHOLD_SECONDS = int(os.getenv("HEALTH_THRESHOLD_SECONDS", "60"))
 
 # Requeue the message if the Airflow API call fails, so no event is lost.
 API_RETRY_LIMIT = int(os.getenv("API_RETRY_LIMIT", "5"))
@@ -62,9 +63,58 @@ def load_queue_dag_map():
     raise RuntimeError(f"Cannot parse QUEUE_DAG_MAP: not JSON and not a file: {raw!r}")
 
 
+class HealthState:
+    """Shared, thread-safe liveness state updated by the consumer loop."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._last_seen = time.time()
+
+    def touch(self):
+        with self._lock:
+            self._last_seen = time.time()
+
+    def age(self):
+        with self._lock:
+            return time.time() - self._last_seen
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    health = None  # set in main()
+
+    def do_GET(self):
+        if self.path != "/healthz":
+            self.send_response(404)
+            self.end_headers()
+            return
+        age = HealthHandler.health.age()
+        if age <= HEALTH_THRESHOLD_SECONDS:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "ok", "age": age}).encode())
+        else:
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "dead", "age": age}).encode())
+
+    def log_message(self, *args):  # silence default logging
+        pass
+
+
+def start_health_server(health: HealthState):
+    HealthHandler.health = health
+    server = ThreadingHTTPServer(("0.0.0.0", HEALTH_PORT), HealthHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    return server
+
+
 class Router:
-    def __init__(self, queue_dag_map: dict):
+    def __init__(self, queue_dag_map: dict, health: HealthState):
         self.queue_dag_map = queue_dag_map
+        self.health = health
         self._stop = False
         signal.signal(signal.SIGTERM, self._handle_signal)
         signal.signal(signal.SIGINT, self._handle_signal)
@@ -83,26 +133,12 @@ class Router:
             self.channel.queue_declare(queue=queue, durable=True)
         self.channel.basic_qos(prefetch_count=10)
 
-        self.pg_conn = psycopg2.connect(
-            host=PG_HOST, port=PG_PORT, user=PG_USER, password=PG_PASS, dbname=PG_DB
-        )
-        self.pg_conn.autocommit = True
-        self.pg_cursor = self.pg_conn.cursor()
-        self._last_heartbeat = 0.0
-        self._write_heartbeat()
-
         self.session = requests.Session()
         self.session.auth = (AIRFLOW_USER, AIRFLOW_PASS)
 
     def _handle_signal(self, signum, frame):
         print(f"Received signal {signum}, shutting down gracefully...")
         self._stop = True
-
-    def _write_heartbeat(self):
-        self.pg_cursor.execute(
-            f"INSERT INTO {HEARTBEAT_TABLE} (last_seen) VALUES (NOW())"
-        )
-        self._last_heartbeat = time.time()
 
     def _trigger_dag(self, dag_id: str, payload: dict) -> bool:
         url = f"{AIRFLOW_API_URL}/dags/{dag_id}/dagRuns"
@@ -130,6 +166,9 @@ class Router:
         except json.JSONDecodeError:
             payload = {"raw": body.decode("utf-8", errors="replace")}
 
+        # Mark liveness on every received message (proves the consumer is alive).
+        self.health.touch()
+
         if self._trigger_dag(dag_id, payload):
             channel.basic_ack(delivery_tag=method.delivery_tag)
         else:
@@ -150,9 +189,8 @@ class Router:
                 print("[router] RabbitMQ connection lost, reconnecting...")
                 self._reconnect()
                 continue
-            if time.time() - self._last_heartbeat >= HEARTBEAT_INTERVAL:
-                self._write_heartbeat()
-        self.close()
+            # Liveness = the process is alive and looping, independent of traffic.
+            self.health.touch()
 
     def _reconnect(self):
         for _ in range(10):
@@ -186,17 +224,14 @@ class Router:
             self.connection.close()
         except Exception:
             pass
-        try:
-            self.pg_cursor.close()
-            self.pg_conn.close()
-        except Exception:
-            pass
 
 
 def main():
     queue_dag_map = load_queue_dag_map()
     print(f"[router] Loaded {len(queue_dag_map)} queue->DAG mappings")
-    Router(queue_dag_map).run()
+    health = HealthState()
+    start_health_server(health)
+    Router(queue_dag_map, health).run()
     sys.exit(0)
 
 
