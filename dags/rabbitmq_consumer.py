@@ -20,8 +20,6 @@ PG_PASS = os.getenv("PG_PASS", "datapass")
 PG_DB = os.getenv("PG_DB", "datadb")
 PG_TABLE = os.getenv("PG_TABLE", "messages")
 
-MAX_IDLE_SECONDS = int(os.getenv("MAX_IDLE_SECONDS", "300"))
-
 
 class Consumer:
     def __init__(self):
@@ -45,7 +43,6 @@ class Consumer:
         self.channel.basic_qos(prefetch_count=10)
 
         self._stop = False
-        self._last_message_ts = time.time()
         signal.signal(signal.SIGTERM, self._handle_signal)
         signal.signal(signal.SIGINT, self._handle_signal)
 
@@ -62,7 +59,6 @@ class Consumer:
         try:
             self._store(body)
             channel.basic_ack(delivery_tag=method.delivery_tag)
-            self._last_message_ts = time.time()
             print(f"[x] Stored: {body.decode('utf-8')[:120]}")
         except Exception as exc:
             print(f"[!] Error storing message, rejecting: {exc}")
@@ -80,10 +76,6 @@ class Consumer:
                 print("[!] Connection lost, reconnecting...")
                 self._reconnect()
                 continue
-
-            if time.time() - self._last_message_ts > MAX_IDLE_SECONDS:
-                print(f"[*] Idle for {MAX_IDLE_SECONDS}s, exiting for restart.")
-                break
 
         self.close()
 
